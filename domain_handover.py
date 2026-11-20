@@ -18,16 +18,26 @@ from genlayer import *
 # A handover is only paid out after TWO matching checks at least
 # `hold_seconds` apart, so a seller cannot flip the nameservers, get paid and
 # flip them back. Any failing check during the hold resets the deal.
+# After the hold, 80% goes to the seller and 20% stays locked for a retention
+# period. If validators see the domain back on the seller's ORIGINAL setup
+# (recorded at acceptance), the retained 20% returns to the buyer.
 # If the seller never delivers, the buyer is refunded after the deadline.
-# Every deal is its own escrow. There is no shared pool and no demo money path.
+# Every deal is its own escrow. There is no shared pool, so a test contract
+# can never touch anyone else's money.
 
 from datetime import datetime, timezone
 import json
 
 WEI = 10 ** 18
 MIN_PRICE_WEI = WEI // 1000          # 0.001 GEN
-MIN_HOLD_SECONDS = 300               # 5 minutes floor (production: use 86400)
+# Floors depend on how the contract was deployed (see __init__).
+LIVE_MIN_HOLD = 86400                # live contract: hold at least 24 h
+LIVE_MIN_RETENTION = 7 * 86400       # live contract: retention at least 7 days
+TEST_MIN_HOLD = 300                  # test contract only: 5 min, for Studio demos
+TEST_MIN_RETENTION = 300
 MAX_HOLD_SECONDS = 7 * 86400
+MAX_RETENTION_SECONDS = 90 * 86400
+RETAIN_BPS = 2000                    # 20% of the price stays locked during retention
 MIN_DEADLINE_HOURS = 1
 MAX_DEADLINE_HOURS = 60 * 24         # 60 days (inter-registrar transfers can take ~7)
 VERIFY_GRACE_SECONDS = 86400         # time to finish a hold that started before the deadline
@@ -50,13 +60,19 @@ MATCH = "MATCH"
 NO_MATCH = "NO_MATCH"
 UNREADABLE = "UNREADABLE"
 
+REVERTED = "REVERTED"      # retention check: back on the seller's original setup
+CHANGED = "CHANGED"        # retention check: neither target nor original
+
 # Deal statuses
-OPEN = "OPEN"              # funded by buyer, waiting for seller to accept
-ACCEPTED = "ACCEPTED"      # seller agreed, handover in progress
-VERIFYING = "VERIFYING"    # first matching check passed, hold running
-DISPUTED = "DISPUTED"      # buyer disputed during hold, arbiter decides
-PAID = "PAID"              # seller paid
-REFUNDED = "REFUNDED"      # buyer refunded
+OPEN = "OPEN"                      # funded by buyer, waiting for seller to accept
+ACCEPTED = "ACCEPTED"              # seller agreed, handover in progress
+VERIFYING = "VERIFYING"            # first matching check passed, hold running
+DISPUTED = "DISPUTED"              # buyer disputed during hold, arbiter decides
+RETAINED = "RETAINED"              # 80% paid, 20% locked until retention ends
+RETENTION_DISPUTED = "RETENTION_DISPUTED"  # retention check was CHANGED, arbiter decides
+PAID = "PAID"                      # closed, seller got everything still owed
+REFUNDED = "REFUNDED"              # closed, buyer got the full price back
+CLAWED_BACK = "CLAWED_BACK"        # closed, 80% to seller, retained 20% back to buyer
 
 
 # ---------------- payouts ----------------
@@ -241,9 +257,31 @@ def decide(state: dict, mode: str, target_registrar: str, target_ns: list, accep
     return {"verdict": MATCH if len(reasons) == 0 else NO_MATCH, "reasons": reasons}
 
 
+def classify_retention(state: dict, mode: str, target_registrar: str, target_ns: list,
+                       baseline_registrar: str, baseline_ns: list) -> str:
+    # Pure function used after the 80% payout.
+    # MATCH    = still on the buyer's target registrar + nameservers
+    # REVERTED = back on the seller's original nameservers (or, for TRANSFER
+    #            mode, back at the seller's original registrar)
+    # CHANGED  = something else (cannot be blamed on either side automatically)
+    if state["registrar_id"] == "" or len(state["rdap_ns"]) == 0:
+        return UNREADABLE
+    if state["registrar_id"] == target_registrar and state["rdap_ns"] == target_ns \
+            and state["dns_ns"] == target_ns:
+        return MATCH
+    if state["rdap_ns"] == baseline_ns:
+        return REVERTED
+    if mode == "TRANSFER" and state["registrar_id"] == baseline_registrar:
+        return REVERTED
+    return CHANGED
+
+
 # ---------------- contract ----------------
 
 class DomainHandover(gl.Contract):
+    test_mode: bool               # True only on a contract deployed for demos
+    min_hold: u256
+    min_retention: u256
     next_id: u256
     deals: TreeMap[str, str]      # deal id -> deal JSON
     lookups: TreeMap[str, str]    # domain -> last consensus snapshot JSON
@@ -252,7 +290,10 @@ class DomainHandover(gl.Contract):
     paid_total: u256
     refunded_total: u256
 
-    def __init__(self):
+    def __init__(self, test_mode: bool):
+        self.test_mode = bool(test_mode)
+        self.min_hold = TEST_MIN_HOLD if self.test_mode else LIVE_MIN_HOLD
+        self.min_retention = TEST_MIN_RETENTION if self.test_mode else LIVE_MIN_RETENTION
         self.next_id = 0
         self.escrow_total = 0
         self.paid_total = 0
@@ -277,6 +318,13 @@ class DomainHandover(gl.Contract):
         if len(d["history"]) > 40:
             d["history"] = d["history"][-40:]
 
+    def _record_check(self, d: dict, now: int, kind: str, verdict: str, reasons: list, st: dict) -> None:
+        d["checks"].append({"at": now, "kind": kind, "verdict": verdict, "reasons": reasons,
+                            "registrar_id": st["registrar_id"], "rdap_ns": st["rdap_ns"],
+                            "dns_ns": st["dns_ns"]})
+        if len(d["checks"]) > 20:
+            d["checks"] = d["checks"][-20:]
+
     def _consensus_state(self, domain: str) -> dict:
         def fetch() -> str:
             try:
@@ -286,27 +334,57 @@ class DomainHandover(gl.Contract):
                                    "last_transfer": 0}, sort_keys=True)
         return json.loads(gl.eq_principle.strict_eq(fetch))
 
-    def _release(self, d: dict, now: int, why: str) -> None:
-        amount = int(d["price_wei"])
-        d["status"] = PAID
+    def _locked(self, d: dict) -> int:
+        return int(d["price_wei"]) - int(d["paid_wei"]) - int(d["refunded_wei"])
+
+    def _close(self, d: dict, status: str, now: int) -> None:
+        d["status"] = status
         d["closed_at"] = now
         self.active[d["domain"]] = ""
-        self._log(d, "PAID to seller: " + why, now)
+
+    def _pay_seller(self, d: dict, amount: int, now: int, why: str) -> None:
+        if amount <= 0:
+            return
+        d["paid_wei"] = str(int(d["paid_wei"]) + amount)
         self.escrow_total = int(self.escrow_total) - amount
         self.paid_total = int(self.paid_total) + amount
-        self._put(d)
+        self._log(d, "PAID " + str(amount) + " wei to seller: " + why, now)
         pay(d["seller"], amount)
 
-    def _refund(self, d: dict, now: int, why: str) -> None:
-        amount = int(d["price_wei"])
-        d["status"] = REFUNDED
-        d["closed_at"] = now
-        self.active[d["domain"]] = ""
-        self._log(d, "REFUNDED to buyer: " + why, now)
+    def _pay_buyer(self, d: dict, amount: int, now: int, why: str) -> None:
+        if amount <= 0:
+            return
+        d["refunded_wei"] = str(int(d["refunded_wei"]) + amount)
         self.escrow_total = int(self.escrow_total) - amount
         self.refunded_total = int(self.refunded_total) + amount
-        self._put(d)
+        self._log(d, "REFUNDED " + str(amount) + " wei to buyer: " + why, now)
         pay(d["buyer"], amount)
+
+    def _release_all(self, d: dict, now: int, why: str) -> None:
+        amount = self._locked(d)
+        self._close(d, PAID, now)
+        self._put(d)
+        self._pay_seller(d, amount, now, why)
+        self._put(d)
+
+    def _refund_all(self, d: dict, now: int, why: str) -> None:
+        amount = self._locked(d)
+        self._close(d, REFUNDED, now)
+        self._put(d)
+        self._pay_buyer(d, amount, now, why)
+        self._put(d)
+
+    def _hold_complete(self, d: dict, now: int, why: str) -> None:
+        # Hold passed: pay 80% now, keep 20% for the retention period.
+        price = int(d["price_wei"])
+        retained = price * RETAIN_BPS // 10000
+        first = price - retained
+        d["status"] = RETAINED
+        d["retained_wei"] = str(retained)
+        d["retained_until"] = now + int(d["retention_seconds"])
+        self._put(d)
+        self._pay_seller(d, first, now, why + " (retention started)")
+        self._put(d)
 
     # ---------- public lookup (helps buyers fill in a deal) ----------
 
@@ -324,7 +402,7 @@ class DomainHandover(gl.Contract):
     @gl.public.write.payable
     def open_deal(self, domain: str, seller: str, mode: str, target_registrar_id: str,
                   target_nameservers: str, deadline_hours: int, hold_seconds: int,
-                  arbiter: str) -> None:
+                  retention_seconds: int, arbiter: str) -> None:
         price = int(gl.message.value)
         if price < MIN_PRICE_WEI:
             raise Exception("Send the deal price (at least 0.001 GEN) as value")
@@ -347,8 +425,11 @@ class DomainHandover(gl.Contract):
         if dh < MIN_DEADLINE_HOURS or dh > MAX_DEADLINE_HOURS:
             raise Exception("deadline_hours must be " + str(MIN_DEADLINE_HOURS) + ".." + str(MAX_DEADLINE_HOURS))
         hs = int(hold_seconds)
-        if hs < MIN_HOLD_SECONDS or hs > MAX_HOLD_SECONDS:
-            raise Exception("hold_seconds must be " + str(MIN_HOLD_SECONDS) + ".." + str(MAX_HOLD_SECONDS))
+        if hs < int(self.min_hold) or hs > MAX_HOLD_SECONDS:
+            raise Exception("hold_seconds must be " + str(int(self.min_hold)) + ".." + str(MAX_HOLD_SECONDS))
+        rs = int(retention_seconds)
+        if rs < int(self.min_retention) or rs > MAX_RETENTION_SECONDS:
+            raise Exception("retention_seconds must be " + str(int(self.min_retention)) + ".." + str(MAX_RETENTION_SECONDS))
         if dom in self.active and self.active[dom] != "":
             raise Exception("This domain already has an active deal (#" + self.active[dom] + ")")
 
@@ -363,12 +444,19 @@ class DomainHandover(gl.Contract):
             "mode": m,
             "target_registrar_id": clean_registrar_id(target_registrar_id),
             "target_ns": clean_ns_list(target_nameservers),
+            "baseline_registrar_id": "",
+            "baseline_ns": [],
             "price_wei": str(price),
+            "paid_wei": "0",
+            "refunded_wei": "0",
+            "retained_wei": "0",
             "created_at": now,
             "deadline": now + dh * 3600,
             "hold_seconds": hs,
+            "retention_seconds": rs,
             "accepted_at": 0,
             "first_match_at": 0,
+            "retained_until": 0,
             "disputed_at": 0,
             "closed_at": 0,
             "status": OPEN,
@@ -383,6 +471,8 @@ class DomainHandover(gl.Contract):
 
     @gl.public.write
     def accept_deal(self, deal_id: int) -> None:
+        # Validators record the seller's ORIGINAL setup (baseline). It is used
+        # later to detect a seller who moves the domain back after payout.
         d = self._deal(deal_id)
         if self._sender() != d["seller"]:
             raise Exception("Only the seller can accept")
@@ -391,23 +481,32 @@ class DomainHandover(gl.Contract):
         now = now_s()
         if now >= int(d["deadline"]):
             raise Exception("Deadline passed")
+        st = self._consensus_state(d["domain"])
+        if st["registrar_id"] == "" or len(st["rdap_ns"]) == 0:
+            raise Exception("Registry record unreadable right now; try accepting again later")
+        already = decide(st, "PUSH", d["target_registrar_id"], d["target_ns"], 0)["verdict"] == MATCH
+        if already and not bool(self.test_mode):
+            raise Exception("Domain is already on the target setup; there is nothing to hand over")
+        d["baseline_registrar_id"] = st["registrar_id"]
+        d["baseline_ns"] = st["rdap_ns"]
         d["status"] = ACCEPTED
         d["accepted_at"] = now
-        self._log(d, "ACCEPTED by seller", now)
+        self._record_check(d, now, "baseline", "BASELINE", [], st)
+        self._log(d, "ACCEPTED by seller" + (" (test mode: already on target)" if already else ""), now)
         self._put(d)
 
     @gl.public.write
     def cancel_deal(self, deal_id: int) -> None:
         # Buyer may cancel before the seller accepts. Seller may decline any time
-        # before a payout (this always returns money to the buyer).
+        # before the first payout (this always returns money to the buyer).
         d = self._deal(deal_id)
         who = self._sender()
         now = now_s()
         if who == d["buyer"] and d["status"] == OPEN:
-            self._refund(d, now, "buyer cancelled before acceptance")
+            self._refund_all(d, now, "buyer cancelled before acceptance")
             return
         if who == d["seller"] and d["status"] in (OPEN, ACCEPTED, VERIFYING):
-            self._refund(d, now, "seller declined")
+            self._refund_all(d, now, "seller declined")
             return
         raise Exception("You cannot cancel this deal now")
 
@@ -428,14 +527,9 @@ class DomainHandover(gl.Contract):
 
         st = self._consensus_state(d["domain"])
         res = decide(st, d["mode"], d["target_registrar_id"], d["target_ns"], int(d["accepted_at"]))
-        d["checks"].append({"at": now, "verdict": res["verdict"], "reasons": res["reasons"],
-                            "registrar_id": st["registrar_id"], "rdap_ns": st["rdap_ns"],
-                            "dns_ns": st["dns_ns"]})
-        if len(d["checks"]) > 20:
-            d["checks"] = d["checks"][-20:]
+        self._record_check(d, now, "handover", res["verdict"], res["reasons"], st)
 
         if res["verdict"] == UNREADABLE:
-            # Sources down: change nothing, try again later.
             self._log(d, "check UNREADABLE (no state change)", now)
             self._put(d)
             return
@@ -450,7 +544,6 @@ class DomainHandover(gl.Contract):
             self._put(d)
             return
 
-        # MATCH
         if d["status"] == ACCEPTED:
             d["status"] = VERIFYING
             d["first_match_at"] = now
@@ -464,17 +557,65 @@ class DomainHandover(gl.Contract):
             self._put(d)
             return
 
-        self._release(d, now, "two matching checks " + str(now - int(d["first_match_at"])) + "s apart")
+        self._hold_complete(d, now, "two matching checks " + str(now - int(d["first_match_at"])) + "s apart")
+
+    @gl.public.write
+    def retention_check(self, deal_id: int) -> None:
+        # Buyer may check at any time during retention (to catch a revert early).
+        # Seller may check once retention has ended (to collect the last 20%).
+        d = self._deal(deal_id)
+        if d["status"] != RETAINED:
+            raise Exception("Deal is not in retention")
+        who = self._sender()
+        now = now_s()
+        ended = now >= int(d["retained_until"])
+        if who == d["seller"]:
+            if not ended:
+                raise Exception("Retention has not ended yet")
+        elif who != d["buyer"]:
+            raise Exception("Only buyer or seller can request a retention check")
+
+        st = self._consensus_state(d["domain"])
+        v = classify_retention(st, d["mode"], d["target_registrar_id"], d["target_ns"],
+                               d["baseline_registrar_id"], d["baseline_ns"])
+        self._record_check(d, now, "retention", v, [], st)
+
+        if v == UNREADABLE:
+            self._log(d, "retention check UNREADABLE (no state change)", now)
+            self._put(d)
+            return
+        if v == REVERTED:
+            amount = self._locked(d)
+            self._close(d, CLAWED_BACK, now)
+            self._put(d)
+            self._pay_buyer(d, amount, now, "domain moved back to the seller's original setup")
+            self._put(d)
+            return
+        if not ended:
+            self._log(d, "retention check " + v + " (retention still running)", now)
+            self._put(d)
+            return
+        if v == MATCH:
+            self._release_all(d, now, "retention ended, domain still on target")
+            return
+        # CHANGED after retention: not the seller's original setup, not the target.
+        if d["arbiter"] != "":
+            d["status"] = RETENTION_DISPUTED
+            d["disputed_at"] = now
+            self._log(d, "retention CHANGED: arbiter decides the retained part", now)
+            self._put(d)
+            return
+        self._release_all(d, now, "retention ended; setup changed but not back to the seller's")
 
     @gl.public.write
     def confirm_received(self, deal_id: int) -> None:
-        # Buyer can release early once happy.
+        # Buyer can release everything still locked, at any stage.
         d = self._deal(deal_id)
         if self._sender() != d["buyer"]:
             raise Exception("Only the buyer can confirm")
-        if d["status"] not in (OPEN, ACCEPTED, VERIFYING, DISPUTED):
+        if d["status"] not in (OPEN, ACCEPTED, VERIFYING, DISPUTED, RETAINED, RETENTION_DISPUTED):
             raise Exception("Deal is closed")
-        self._release(d, now_s(), "buyer confirmed")
+        self._release_all(d, now_s(), "buyer confirmed")
 
     @gl.public.write
     def refund_after_deadline(self, deal_id: int) -> None:
@@ -485,12 +626,12 @@ class DomainHandover(gl.Contract):
         if d["status"] in (OPEN, ACCEPTED):
             if now < int(d["deadline"]):
                 raise Exception("Deadline not reached yet")
-            self._refund(d, now, "deadline passed without a verified handover")
+            self._refund_all(d, now, "deadline passed without a verified handover")
             return
         if d["status"] == VERIFYING:
             if now <= int(d["deadline"]) + int(d["hold_seconds"]) + VERIFY_GRACE_SECONDS:
                 raise Exception("A hold is running; refund opens after the grace period")
-            self._refund(d, now, "hold was never completed")
+            self._refund_all(d, now, "hold was never completed")
             return
         raise Exception("Deal cannot be refunded now")
 
@@ -514,29 +655,37 @@ class DomainHandover(gl.Contract):
 
     @gl.public.write
     def arbiter_decide(self, deal_id: int, release_to_seller: bool) -> None:
+        # Decides whatever is still locked (full price in DISPUTED,
+        # the retained 20% in RETENTION_DISPUTED).
         d = self._deal(deal_id)
-        if d["status"] != DISPUTED:
+        if d["status"] not in (DISPUTED, RETENTION_DISPUTED):
             raise Exception("Deal is not disputed")
         if self._sender() != d["arbiter"]:
             raise Exception("Only the arbiter can decide")
         now = now_s()
         if bool(release_to_seller):
-            self._release(d, now, "arbiter decision")
+            self._release_all(d, now, "arbiter decision")
+        elif d["status"] == RETENTION_DISPUTED:
+            amount = self._locked(d)
+            self._close(d, CLAWED_BACK, now)
+            self._put(d)
+            self._pay_buyer(d, amount, now, "arbiter decision")
+            self._put(d)
         else:
-            self._refund(d, now, "arbiter decision")
+            self._refund_all(d, now, "arbiter decision")
 
     @gl.public.write
     def settle_stale_dispute(self, deal_id: int) -> None:
         # If the arbiter is silent, the public evidence (two matches) stands.
         d = self._deal(deal_id)
-        if d["status"] != DISPUTED:
+        if d["status"] not in (DISPUTED, RETENTION_DISPUTED):
             raise Exception("Deal is not disputed")
         if self._sender() not in (d["buyer"], d["seller"]):
             raise Exception("Only buyer or seller")
         now = now_s()
         if now < int(d["disputed_at"]) + ARBITER_TIMEOUT_SECONDS:
             raise Exception("Arbiter still has time")
-        self._release(d, now, "arbiter timeout, evidence stands")
+        self._release_all(d, now, "arbiter timeout, evidence stands")
 
     # ---------- views ----------
 
@@ -557,10 +706,13 @@ class DomainHandover(gl.Contract):
     @gl.public.view
     def get_stats(self) -> str:
         return json.dumps({
+            "test_mode": bool(self.test_mode),
             "deals": int(self.next_id),
             "escrow_wei": str(int(self.escrow_total)),
             "paid_wei": str(int(self.paid_total)),
             "refunded_wei": str(int(self.refunded_total)),
-            "min_hold_seconds": MIN_HOLD_SECONDS,
+            "min_hold_seconds": int(self.min_hold),
+            "min_retention_seconds": int(self.min_retention),
+            "retain_bps": RETAIN_BPS,
             "supported_tlds": sorted(RDAP_BASE.keys()),
         })
